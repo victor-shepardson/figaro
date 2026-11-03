@@ -1,9 +1,9 @@
 import pretty_midi
 from collections import Counter
-import torchtext
+# import torchtext.vocab
 from torch import Tensor
 
-from constants import (
+from .constants import (
   DEFAULT_VELOCITY_BINS,
   DEFAULT_DURATION_BINS,
   DEFAULT_TEMPO_BINS,
@@ -15,7 +15,7 @@ from constants import (
 )
 
 
-from constants import (
+from .constants import (
   MAX_BAR_LENGTH,
   MAX_N_BARS,
 
@@ -96,9 +96,57 @@ class Tokens:
       position_tokens
     )
 
+class _SimpleVocab:
+  """Minimal pure-Python stand-in for torchtext.vocab.Vocab.
+ 
+  Implements only the methods FIGARO uses, with the same index ordering
+  as torchtext.vocab.vocab(counter): tokens keep the counter's insertion
+  order, and insert_token() shifts later tokens up by one.
+  """
+ 
+  def __init__(self, tokens):
+    self._itos = list(dict.fromkeys(tokens))
+    self._rebuild_stoi()
+    self._default_index = None
+ 
+  def _rebuild_stoi(self):
+    self._stoi = {tok: i for i, tok in enumerate(self._itos)}
+ 
+  def insert_token(self, token, index):
+    if token in self._stoi:
+      raise RuntimeError(f"Token {token} already exists in the Vocab")
+    self._itos.insert(index, token)
+    self._rebuild_stoi()
+ 
+  def set_default_index(self, index):
+    self._default_index = index
+ 
+  def get_stoi(self):
+    return self._stoi
+ 
+  def get_itos(self):
+    return self._itos
+ 
+  def lookup_index(self, token):
+    idx = self._stoi.get(token, self._default_index)
+    if idx is None:
+      raise RuntimeError(f"Token {token} not found and default index is not set")
+    return idx
+ 
+  def lookup_tokens(self, indices):
+    return [self._itos[int(i)] for i in indices]
+ 
+  def __call__(self, tokens):
+    return [self.lookup_index(tok) for tok in tokens]
+ 
+  def __len__(self):
+    return len(self._itos)
+
+
 class Vocab:
   def __init__(self, counter, specials=[PAD_TOKEN, UNK_TOKEN, BOS_TOKEN, EOS_TOKEN, MASK_TOKEN], unk_token=UNK_TOKEN):
-    self.vocab = torchtext.vocab.vocab(counter)
+    # self.vocab = torchtext.vocab.vocab(counter)
+    self.vocab = _SimpleVocab(counter)
 
     self.specials = specials
     for i, token in enumerate(self.specials):

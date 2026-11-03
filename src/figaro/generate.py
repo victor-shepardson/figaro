@@ -6,11 +6,11 @@ import random
 from torch.utils.data import DataLoader
 from transformers.models.bert.modeling_bert import BertAttention
 
-from models.vae import VqVaeModule
-from models.seq2seq import Seq2SeqModule
-from datasets import MidiDataset, SeqCollator
-from utils import medley_iterator
-from input_representation import remi2midi
+from .models.vae import VqVaeModule
+from .models.seq2seq import Seq2SeqModule
+from .datasets import MidiDataset, SeqCollator
+from .utils import medley_iterator
+from .input_representation import remi2midi
 
 
 def parse_args():
@@ -20,6 +20,7 @@ def parse_args():
   parser.add_argument('--model', type=str, default="figaro-expert")
   parser.add_argument('--checkpoint', type=str, default="../figaro-expert.ckpt")
   parser.add_argument('--vae_checkpoint', type=str, default=None, help="Path to the VQ-VAE model checkpoint (optional)")
+  parser.add_argument('--midi_file', type=str, default=None, help="Path to one MIDI file to process")
   parser.add_argument('--lmd_dir', type=str, default='./lmd_full', help="Path to the root directory of the LakhMIDI dataset")
   parser.add_argument('--output_dir', type=str, default='./samples', help="Path to the output directory")
   parser.add_argument('--max_n_files', type=int, default=-1)
@@ -29,6 +30,7 @@ def parse_args():
   parser.add_argument('--n_medley_pieces', type=int, default=2)
   parser.add_argument('--n_medley_bars', type=int, default=16)
   parser.add_argument('--batch_size', type=int, default=1)
+  parser.add_argument('--device', type=str, default='auto')
   parser.add_argument('--verbose', type=int, default=2)
   args = parser.parse_args()
   return args
@@ -36,7 +38,7 @@ def parse_args():
 
 def load_old_or_new_checkpoint(model_class, checkpoint):
   # assuming transformers>=4.36.0
-  pl_ckpt = torch.load(checkpoint, map_location="cpu")
+  pl_ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
   kwargs = pl_ckpt['hyper_parameters']
   if 'flavor' in kwargs:
     del kwargs['flavor']
@@ -91,6 +93,9 @@ def reconstruct_sample(model, batch,
     batch_['desc_bar_ids'] = batch['desc_bar_ids']
   if model.description_flavor in ['latent', 'both']:
     batch_['latents'] = batch['latents']
+
+  print(f'{batch_.keys()=}')
+  print(batch_)
 
   max_len = seq_len + 1024
   if max_iter > 0:
@@ -152,15 +157,18 @@ def main():
 
   print(f"Saving generated files to: {output_dir}")
 
-  model, vae_module = load_model(args.checkpoint, args.vae_checkpoint)
+  model, vae_module = load_model(args.checkpoint, args.vae_checkpoint, device=args.device)
 
 
-  midi_files = glob.glob(os.path.join(args.lmd_dir, '**/*.mid'), recursive=True)
+  if args.midi_file is not None:
+    midi_files = [args.midi_file]
+  else:
+    midi_files = glob.glob(os.path.join(args.lmd_dir, '**/*.mid'), recursive=True)
+    dm = model.get_datamodule(midi_files, vae_module=vae_module)
+    dm.setup('test')
+    midi_files = dm.test_ds.files
+    random.shuffle(midi_files)
   
-  dm = model.get_datamodule(midi_files, vae_module=vae_module)
-  dm.setup('test')
-  midi_files = dm.test_ds.files
-  random.shuffle(midi_files)
 
   if args.max_n_files > 0:
     midi_files = midi_files[:args.max_n_files]

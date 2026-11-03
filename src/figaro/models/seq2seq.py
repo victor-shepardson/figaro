@@ -4,9 +4,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 import math
-from datasets import MidiDataModule
-from vocab import RemiVocab, DescriptionVocab
-from constants import PAD_TOKEN, EOS_TOKEN, BAR_KEY, POSITION_KEY
+from ..datasets import MidiDataModule
+from ..vocab import RemiVocab, DescriptionVocab
+from ..constants import PAD_TOKEN, EOS_TOKEN, BAR_KEY, POSITION_KEY
 
 
 import transformers

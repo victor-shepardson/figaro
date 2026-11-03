@@ -7,9 +7,9 @@ import math
 import os
 import pickle
 
-from input_representation import InputRepresentation
-from vocab import RemiVocab, DescriptionVocab
-from constants import (
+from .input_representation import InputRepresentation
+from .vocab import RemiVocab, DescriptionVocab
+from .constants import (
   PAD_TOKEN, BOS_TOKEN, EOS_TOKEN, BAR_KEY, POSITION_KEY,
   TIME_SIGNATURE_KEY, INSTRUMENT_KEY, CHORD_KEY,
   NOTE_DENSITY_KEY, MEAN_PITCH_KEY, MEAN_VELOCITY_KEY, MEAN_DURATION_KEY
@@ -330,6 +330,8 @@ class MidiDataset(IterableDataset):
           'bar_ids': b_ids,
           'position_ids': p_ids,
         }
+
+        print(f'{current_file["description"]=}')
 
         if self.description_flavor in ['description', 'both']:
           # Assume that bar_ids are in ascending order (except for EOS)

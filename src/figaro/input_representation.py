@@ -1,10 +1,10 @@
-from chord_recognition import MIDIChord
+from .chord_recognition import MIDIChord
 import numpy as np
 import pretty_midi
 
-from vocab import RemiVocab
+from .vocab import RemiVocab
 
-from constants import (
+from .constants import (
   EOS_TOKEN,
   # vocab keys
   TIME_SIGNATURE_KEY,

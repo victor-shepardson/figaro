@@ -4,7 +4,7 @@ from statistics import NormalDist
 import pandas as pd
 import numpy as np
 
-import input_representation as ir
+import .input_representation as ir
 
 METRICS = [
   'inst_prec', 'inst_rec', 'inst_f1', 
