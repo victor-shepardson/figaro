@@ -425,3 +425,71 @@ class Seq2SeqModule(pl.LightningModule):
       'position_ids': position_ids
     }
 
+
+  @torch.no_grad()
+  def sample_fast(self, batch, 
+    max_length=256, 
+    max_bars=-1,
+    temp=0.8,
+    pad_token=PAD_TOKEN, 
+    eos_token=EOS_TOKEN,
+    verbose=0,
+    cache=True,
+    min_context=None,
+  ):
+    """Same as sample, using fast.FastDecoder (description models only).
+
+    cache=False matches sample up to float error; cache=True uses a strided window of 
+    min_context to context_size tokens (see fast.FastDecoder).
+    """
+    from . import fast
+    assert self.description_flavor == 'description', 'only description models are supported'
+
+    pad_token_id = self.vocab.to_i(pad_token)
+    eos_token_id = self.vocab.to_i(eos_token)
+
+    batch_size, curr_len = batch['input_ids'].shape
+    x = batch['input_ids']
+    bar_ids = batch['bar_ids']
+    position_ids = batch['position_ids']
+    assert x.shape[:2] == bar_ids.shape and x.shape[:2] == position_ids.shape, f"Input, bar and position ids weren't of compatible shapes: {x.shape}, {bar_ids.shape}, {position_ids.shape}"
+
+    decoder = fast.FastDecoder(
+      self, fast.description_encoder(self, batch['description'], batch['desc_bar_ids']),
+      cache=cache, min_context=min_context)
+    is_done = torch.zeros(batch_size, dtype=torch.bool)
+
+    for i in range(curr_len - 1, max_length):
+      logits = decoder.logits(x, bar_ids, position_ids) / temp
+
+      pr = F.softmax(logits, dim=-1)
+      next_token_ids = torch.multinomial(pr, 1).view(-1).to(x.device)
+      next_tokens = self.vocab.decode(next_token_ids)
+      if verbose:
+        print(f"{i+1}/{max_length}", next_tokens)
+
+      next_bars = torch.tensor([1 if f'{BAR_KEY}_' in token else 0 for token in next_tokens], dtype=torch.int)
+      next_bar_ids = bar_ids[:, i].clone() + next_bars
+
+      next_positions = [f"{POSITION_KEY}_0" if f'{BAR_KEY}_' in token else token for token in next_tokens]
+      next_positions = [int(token.split('_')[-1]) if f'{POSITION_KEY}_' in token else None for token in next_positions]
+      next_positions = [pos if next_pos is None else next_pos for pos, next_pos in zip(position_ids[:, i], next_positions)]
+      next_position_ids = torch.tensor(next_positions, dtype=torch.int)
+
+      is_done.masked_fill_((next_token_ids == eos_token_id).all(dim=-1), True)
+      next_token_ids[is_done] = pad_token_id
+      if max_bars > 0:
+        is_done.masked_fill_(next_bar_ids >= max_bars + 1, True)
+
+      x = torch.cat([x, next_token_ids.clone().unsqueeze(1)], dim=1)
+      bar_ids = torch.cat([bar_ids, next_bar_ids.unsqueeze(1)], dim=1)
+      position_ids = torch.cat([position_ids, next_position_ids.unsqueeze(1)], dim=1)
+
+      if torch.all(is_done):
+        break
+
+    return {
+      'sequences': x,
+      'bar_ids': bar_ids,
+      'position_ids': position_ids
+    }
