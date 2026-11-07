@@ -8,6 +8,8 @@
 - the last layer only computes the last position, when only next-token logits are needed
 - FastDecoder optionally caches self-attention keys/values with a strided window: the
   window grows to context_size tokens, then restarts with the last min_context tokens
+- BatchedDecoder does the same for a batch of independent sequences, each with its own
+  description, history and cache
 
 Without the cache, results match Seq2SeqModule.encode/decode up to float error.
 With it, the model sees between min_context and context_size tokens of context instead
@@ -279,3 +281,194 @@ class FastDecoder:
       past_kv, last_only=True)
     self.history = history
     return model.out_layer(hidden[:, -1])
+
+
+def _slot_self_attention(q, k, v, key_table, distance_embedding, q_pos):
+  """Causal relative attention with per-sequence query positions.
+
+  q: (b, h, L, d) at positions q_pos (b, L); k, v: (b, h, R, d) at positions 0..R-1
+  key_table: (b, h, R, D) key-side relative scores of each key for distances 0..D-1
+    (D >= R), i.e. k @ distance_embeddings.T
+  """
+  b, h, L, d = q.shape
+  R = k.shape[2]
+  max_pos = (distance_embedding.num_embeddings + 1) // 2
+  table = distance_embedding.weight[max_pos - 1 : max_pos - 1 + R]  # distances 0..R-1
+  distance = q_pos[:, :, None] - torch.arange(R, device=q.device)
+  index = distance.clamp(0, R - 1)
+  scores = q @ k.transpose(-1, -2)
+  scores = scores + (q @ table.T).gather(-1, index[:, None].expand(b, h, L, R))
+  scores = scores + key_table.gather(
+    -1, index.transpose(1, 2)[:, None].expand(b, h, R, L)).transpose(-1, -2)
+  scores = scores / math.sqrt(d)
+  scores = scores.masked_fill((distance < 0)[:, None], float('-inf'))
+  return F.softmax(scores, dim=-1) @ v
+
+
+def _slot_cross_attention(q, k, v, key_scores, distance_embedding, q_pos):
+  """Relative cross-attention with per-sequence query positions.
+
+  q: (b, h, L, d) at positions q_pos (b, L); k, v: (b, h, R, d) at positions 0..R-1
+  key_scores: (b, h, Q, R) key-side relative scores for query positions 0..Q-1, from
+    key_relative_scores
+  """
+  b, h, L, d = q.shape
+  R = k.shape[2]
+  Q = key_scores.shape[2]
+  max_pos = (distance_embedding.num_embeddings + 1) // 2
+  # distances -(R-1)..Q-1
+  table = distance_embedding.weight[max_pos - R : max_pos - 1 + Q]
+  index = q_pos[:, :, None] - torch.arange(R, device=q.device) + R - 1
+  scores = q @ k.transpose(-1, -2)
+  scores = scores + (q @ table.T).gather(-1, index[:, None].expand(b, h, L, R))
+  scores = scores + key_scores.gather(2, q_pos[:, None, :, None].expand(b, h, L, R))
+  scores = scores / math.sqrt(d)
+  return F.softmax(scores, dim=-1) @ v
+
+
+class BatchedDecoder:
+  """Next-token logits for independent token sequences in n_slots slots, each with its
+  own description and strided-window key/value cache, as FastDecoder with cache=True
+  (with the same results up to float error).
+
+  A sequence is put in a slot with assign(slot, encode), where encode is as for
+  FastDecoder (e.g. from description_encoder, for a batch of 1). Each call to logits()
+  takes the current history of some of the slots' sequences, which may have grown or
+  been truncated since the previous call. Slots needing only their last token computed
+  run as one batch (over the range of slots they span); the others (after a
+  truncation, a window restart or forced tokens) run one slot at a time, so they don't
+  pad the batch.
+  """
+  def __init__(self, model, n_slots, min_context=None):
+    self.model = model
+    self.n_ctx = model.context_size
+    self.min_context = min_context or self.n_ctx // 2
+    assert 0 < self.min_context < self.n_ctx
+    self.layers = model.transformer.decoder.bert.encoder.layer
+    attn = self.layers[0].attention.self
+    n_heads, d_head = attn.num_attention_heads, attn.attention_head_size
+    param = next(model.parameters())
+    def buffers(*shape):
+      return [torch.zeros(n_slots, n_heads, *shape, device=param.device, dtype=param.dtype)
+              for _ in self.layers]
+    # per layer: self-attention keys/values of each slot's cached window
+    self.self_k, self.self_v = buffers(self.n_ctx, d_head), buffers(self.n_ctx, d_head)
+    # and the keys' relative scores for each distance 0..n_ctx-1 (computed once per key,
+    # rather than gathering distance embeddings for every query/key pair)
+    self.self_key_table = buffers(self.n_ctx, self.n_ctx)
+    # per layer: cross-attention keys/values and key-side relative scores
+    self.cross_k, self.cross_v = buffers(self.n_ctx, d_head), buffers(self.n_ctx, d_head)
+    self.cross_scores = buffers(self.n_ctx, self.n_ctx)
+    self.n_slots = n_slots
+    self.encode = [None] * n_slots
+    self.start = [0] * n_slots  # index of the first token of the cached window
+    self.length = [0] * n_slots  # number of cached tokens
+    self.history = [None] * n_slots  # (3, T) ids, bar ids, position ids
+    self.first_bar = [None] * n_slots  # first bar id of the window, for cross-attention
+    self.n_forward = 0  # forward passes, for diagnostics
+    self.n_window_starts = 0
+
+  def assign(self, slot, encode):
+    """Start a new sequence in slot."""
+    self.encode[slot] = encode
+    self.start[slot] = self.length[slot] = 0
+    self.history[slot] = self.first_bar[slot] = None
+
+  def _prepare(self, slot, history):
+    """Update slot's window for history (3, T); returns the (3, n) tokens to compute."""
+    T = history.shape[1]
+    old = self.history[slot]
+    # length of the prefix shared with the cached history
+    if old is None:
+      shared = 0
+    else:
+      n = min(T, old.shape[1])
+      mismatch = (history[:, :n] != old[:, :n]).any(0)
+      shared = mismatch.nonzero()[0, 0].item() if mismatch.any() else n
+    if shared <= self.start[slot] or T - self.start[slot] > self.n_ctx:
+      self.start[slot] = 0 if T <= self.n_ctx else T - self.min_context
+      self.n_window_starts += 1
+      shared = self.start[slot]
+    start = self.start[slot]
+    # recompute at least the last token, whose logits weren't kept
+    self.length[slot] = min(shared, T - 1) - start
+    self.history[slot] = history
+    first_bar = history[1, start].item()
+    if first_bar != self.first_bar[slot]:
+      self.first_bar[slot] = first_bar
+      cross_kv = cross_keys_values(self.model, self.encode[slot](history[1, start:start + 1]))
+      for i, (k, v, key_scores) in enumerate(cross_kv):
+        self.cross_k[i][slot], self.cross_v[i][slot] = k[0], v[0]
+        self.cross_scores[i][slot] = key_scores[0]
+    return history[:, start + self.length[slot]:]
+
+  @torch.no_grad()
+  def logits(self, requests):
+    """requests: {slot: (ids, bar_ids, position_ids)}, each a sequence of length T.
+    Returns {slot: logits (vocab,)} for the token following each, on the CPU."""
+    batch, singles = [], []
+    for slot, history in requests.items():
+      new = self._prepare(slot, torch.as_tensor(history, dtype=torch.long))
+      (batch if new.shape[1] == 1 else singles).append((slot, new))
+    out = {}
+    for group in ([batch] if batch else []) + [[single] for single in singles]:
+      out.update(self._forward(group))
+    return out
+
+  def _forward(self, group):
+    """Run the decoder on the new tokens of a group of [(slot, new)], over the range of
+    slots they span (the other slots in it are computed without being cached)."""
+    model = self.model
+    device = self.self_k[0].device
+    slots = [slot for slot, _ in group]
+    lo, hi = min(slots), max(slots) + 1
+    n = max(new.shape[1] for _, new in group)
+    x = torch.zeros(3, hi - lo, n, dtype=torch.long)
+    n_new = torch.zeros(hi - lo, dtype=torch.long)
+    n_past = torch.zeros(hi - lo, dtype=torch.long)
+    for slot, new in group:
+      x[:, slot - lo, :new.shape[1]] = new
+      n_new[slot - lo] = new.shape[1]
+      n_past[slot - lo] = self.length[slot]
+    x, n_new, n_past = x.to(device), n_new.to(device), n_past.to(device)
+    # positions in the window; padding repeats the last new token's position
+    last = (n_new - 1).clamp(min=0)
+    q_pos = n_past[:, None] + torch.minimum(torch.arange(n, device=device), last[:, None])
+    rows, cols = (torch.arange(n, device=device) < n_new[:, None]).nonzero(as_tuple=True)
+    write_slots, write_pos = rows + lo, q_pos[rows, cols]
+    R = int((n_past + n_new).max())
+    all_rows = torch.arange(hi - lo, device=device)
+
+    hidden = model.transformer.decoder.bert.embeddings(inputs_embeds=embed(model, *x))
+    for i, layer in enumerate(self.layers):
+      attn = layer.attention.self
+      n_heads = attn.num_attention_heads
+      q, k, v = (_split_heads(f(hidden), n_heads) for f in (attn.query, attn.key, attn.value))
+      self.self_k[i][write_slots, :, write_pos] = k[rows, :, cols]
+      self.self_v[i][write_slots, :, write_pos] = v[rows, :, cols]
+      max_pos = (attn.distance_embedding.num_embeddings + 1) // 2
+      table = attn.distance_embedding.weight[max_pos - 1 : max_pos - 1 + self.n_ctx]
+      self.self_key_table[i][write_slots, :, write_pos] = k[rows, :, cols] @ table.T
+      if i == len(self.layers) - 1:
+        # only the last new token's output is needed
+        q = q[all_rows, :, last][:, :, None]
+        hidden = hidden[all_rows, last][:, None]
+        q_pos = q_pos[all_rows, last][:, None]
+      context = _slot_self_attention(
+        q, self.self_k[i][lo:hi, :, :R], self.self_v[i][lo:hi, :, :R],
+        self.self_key_table[i][lo:hi, :, :R], attn.distance_embedding, q_pos)
+      hidden = layer.attention.output(_merge_heads(context), hidden)
+
+      attn = layer.crossattention.self
+      q = _split_heads(attn.query(hidden), attn.num_attention_heads)
+      context = _slot_cross_attention(
+        q, self.cross_k[i][lo:hi], self.cross_v[i][lo:hi], self.cross_scores[i][lo:hi],
+        attn.distance_embedding, q_pos)
+      hidden = layer.crossattention.output(_merge_heads(context), hidden)
+
+      hidden = layer.output(layer.intermediate(hidden), hidden)
+    logits = model.out_layer(hidden[:, -1]).float().cpu()
+    for slot, new in group:
+      self.length[slot] += new.shape[1]
+    self.n_forward += 1
+    return {slot: logits[slot - lo] for slot in slots}
