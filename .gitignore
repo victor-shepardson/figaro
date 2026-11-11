@@ -9,3 +9,4 @@ lightning_logs
 tmp
 .venv
 .hypothesis
+*.egg-info
